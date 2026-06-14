@@ -1,0 +1,9 @@
+com\company\mutationsignature\model\CosmicMatrix.class
+com\company\mutationsignature\model\NnlsResult.class
+com\company\mutationsignature\model\SignatureResult.class
+com\company\mutationsignature\controller\SignatureController.class
+com\company\mutationsignature\MutationSignatureApplication.class
+com\company\mutationsignature\model\SignatureResponse.class
+com\company\mutationsignature\model\BiologicalAnnotation.class
+com\company\mutationsignature\model\Mutation.class
+com\company\mutationsignature\service\SignatureService.class
