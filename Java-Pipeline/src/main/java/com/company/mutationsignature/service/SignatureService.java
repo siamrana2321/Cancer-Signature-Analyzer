@@ -28,11 +28,11 @@ public class SignatureService {
             new HashMap<String, String>();
 
     private static final String GENOME_PATH =
-            "D:\\Mohammad_Siam_Ahmed_Rana\\GenomeArc_Backend\\Mutation_Signature\\mutation-signature\\Resources\\genome\\GRCh38.fa";
+            "D:\\Mohammad_Siam_Ahmed_Rana\\Mutation_Signature\\Resources\\genome\\GRCh38.fa";
     private static final String COSMIC_PATH =
-            "D:\\Mohammad_Siam_Ahmed_Rana\\GenomeArc_Backend\\Mutation_Signature\\mutation-signature\\Resources\\cosmic\\COSMIC_v3.6_SBS_GRCh38.txt";
+            "D:\\Mohammad_Siam_Ahmed_Rana\\Mutation_Signature\\Resources\\cosmic\\COSMIC_v3.6_SBS_GRCh38.txt";
     private static final String SBS_Etiology_PATH =
-            "D:\\Mohammad_Siam_Ahmed_Rana\\GenomeArc_Backend\\Mutation_Signature\\mutation-signature\\Resources\\cosmic\\SBS_Etiology.csv";
+            "D:\\Mohammad_Siam_Ahmed_Rana\\Mutation_Signature\\Resources\\cosmic\\SBS_Etiology.csv";
 
     private static final Map<Character, Character> COMPLEMENT =
             new LinkedHashMap<Character, Character>();
