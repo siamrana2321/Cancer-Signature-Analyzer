@@ -46,19 +46,9 @@ public class SignatureService {
 
     }
 
-    public SignatureResponse analyze(MultipartFile file) throws Exception {
+    public SignatureResponse analyze(String filePath) throws Exception {
 
-        if (file == null || file.isEmpty())
-        {
-            throw new RuntimeException("No VCF file uploaded.");
-        }
-
-        if ( !file.getOriginalFilename().toLowerCase().endsWith(".vcf"))
-        {
-            throw new RuntimeException("Uploaded file must be a VCF file.");
-        }
-
-        List<Mutation> mutations = parseVcf(file);
+        List<Mutation> mutations = parseVcf(filePath);
 
         if (mutations.isEmpty()) {
 
@@ -96,9 +86,9 @@ public class SignatureService {
                 fit.getPearson()
         );
 
-        response.setSignaturesDetected(
-                results.size()
-        );
+//        response.setSignaturesDetected(
+//                results.size()
+//        );
 
         response.setCosmicVersion(
                 "COSMIC v3.6 SBS GRCh38"
@@ -620,6 +610,13 @@ public class SignatureService {
                         )
         );
 
+        if (results.size() > 3) {
+
+            return new ArrayList<>(
+                    results.subList(0, 3)
+            );
+        }
+
         return results;
     }
 
@@ -929,13 +926,18 @@ public class SignatureService {
         );
     }
 
-    private List<Mutation> parseVcf(MultipartFile file) throws Exception {
+    private List<Mutation> parseVcf(
+            String filePath
+    ) throws Exception {
 
-        List<Mutation> mutations = new ArrayList<Mutation>();
+        List<Mutation> mutations =
+                new ArrayList<Mutation>();
 
         BufferedReader reader =
                 new BufferedReader(
-                        new InputStreamReader(file.getInputStream())
+                        new FileReader(
+                                filePath
+                        )
                 );
 
         String line;
@@ -952,19 +954,20 @@ public class SignatureService {
                 continue;
             }
 
-            String chromosome = cols[0];
-            long position;
+            String chromosome =
+                    cols[0];
 
-            try {
-                position = Long.parseLong(cols[1]);
-            } catch (NumberFormatException e) {
-                continue;
-            }
+            long position =
+                    Long.parseLong(cols[1]);
 
-            String ref = cols[3];
-            String alt = cols[4];
+            String ref =
+                    cols[3];
 
-            if (ref.length() == 1 && alt.length() == 1) {
+            String alt =
+                    cols[4];
+
+            if (ref.length() == 1 &&
+                    alt.length() == 1) {
 
                 mutations.add(
                         new Mutation(

@@ -15,6 +15,8 @@ import java.util.Collections;
 public class SignatureController {
 
     private final SignatureService service;
+    private static final String SAMPLE_DIRECTORY =
+            "D:\\Mohammad_Siam_Ahmed_Rana\\Mutation_Signature\\Resources\\sample\\";
 
     public SignatureController(
             SignatureService service
@@ -34,16 +36,18 @@ public class SignatureController {
 
     @PostMapping("/analyze")
     public ResponseEntity<?> analyze(
-            @RequestParam("file") MultipartFile file
+            @RequestParam("vcfFileName") String fileName
     ) {
-
+        final String filePath = SAMPLE_DIRECTORY + fileName;
         try {
 
-            SignatureResponse response = service.analyze(file);
+            SignatureResponse response =
+                    service.analyze(filePath);
 
             return ResponseEntity.ok(response);
 
-        } catch (Exception e) {
+        }
+        catch (Exception e) {
 
             return ResponseEntity
                     .status(HttpStatus.INTERNAL_SERVER_ERROR)

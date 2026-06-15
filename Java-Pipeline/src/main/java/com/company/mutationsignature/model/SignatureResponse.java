@@ -12,7 +12,7 @@ public class SignatureResponse {
     private Map<String,Map<String,Double>> sbs96Percentage;
     private List<SignatureResult> cosmicContributions;
     private List<BiologicalAnnotation> biologicalAnnotations;
-    private Integer signaturesDetected;
+    //    private Integer signaturesDetected;
     private String clinicalSummary;
     private Double reconstructionCosine;
     private Double rmse;
@@ -81,13 +81,13 @@ public class SignatureResponse {
         this.clinicalSummary = clinicalSummary;
     }
 
-    public Integer getSignaturesDetected() {
-        return signaturesDetected;
-    }
-
-    public void setSignaturesDetected(Integer signaturesDetected) {
-        this.signaturesDetected = signaturesDetected;
-    }
+//    public Integer getSignaturesDetected() {
+//        return signaturesDetected;
+//    }
+//
+//    public void setSignaturesDetected(Integer signaturesDetected) {
+//        this.signaturesDetected = signaturesDetected;
+//    }
 
     public Double getReconstructionCosine() {
         return reconstructionCosine;
