@@ -8,12 +8,13 @@ import org.springframework.stereotype.Service;
 import java.io.BufferedReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
-public class MutationSignatureService {
-    private static final Logger log = LoggerFactory.getLogger(MutationSignatureService.class);
+public class ID83SignatureService {
+    private static final Logger log = LoggerFactory.getLogger(ID83SignatureService.class);
 
     // Biological annotations (extend as needed)
     private static final Map<String, String> ETIOLOGY_MAP = new HashMap<>();
@@ -44,6 +45,10 @@ public class MutationSignatureService {
         ETIOLOGY_MAP.put("ID24", "Unknown");
         ETIOLOGY_MAP.put("ID25", "Unknown");
     }
+    private static final String GENOME_PATH =
+            "D:\\horizondb\\resources\\refDB\\MutationSignatureDB\\genome\\GRCh38.fa";
+    private static final String COSMIC_PATH =
+            "D:\\horizondb\\resources\\refDB\\MutationSignatureDB\\cosmic\\COSMIC_Human_ID-83_GRCh37_v3.6.tsv";
 
     private static class Annotation {
         String etiology, mechanism, association;
@@ -51,11 +56,11 @@ public class MutationSignatureService {
     }
 
     // ------------------- Main pipeline -------------------
-    public ID83Response runPipeline(Path vcfPath, Path fastaPath, Path cosmicPath) throws Exception {
-        log.info("Starting pipeline: VCF={}, FASTA={}, COSMIC={}", vcfPath, fastaPath, cosmicPath);
+    public ID83Response runPipeline(Path vcfPath) throws Exception {
+        log.info("Starting pipeline: VCF={}", vcfPath);
 
         // 1. Load genome
-        Map<String, String> genome = loadGenome(fastaPath);
+        Map<String, String> genome = loadGenome(Paths.get(GENOME_PATH));
         log.info("Genome loaded: {} chromosomes", genome.size());
 
         // 2. Build ID83 matrix from VCF
@@ -63,7 +68,7 @@ public class MutationSignatureService {
         log.info("Matrix built with {} categories", matrix.size());
 
         // 3. Load COSMIC signatures
-        CosmicData cosmic = loadCosmicSignatures(cosmicPath);
+        CosmicData cosmic = loadCosmicSignatures(Paths.get(COSMIC_PATH));
         log.info("COSMIC loaded: {} categories, {} signatures", cosmic.categories.size(), cosmic.signatureNames.size());
 
         // 4. Align matrix with COSMIC order
