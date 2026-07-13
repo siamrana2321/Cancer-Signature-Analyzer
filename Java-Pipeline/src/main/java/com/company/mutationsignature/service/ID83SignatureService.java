@@ -115,20 +115,39 @@ public class ID83SignatureService {
 
         exposureResults.sort((a, b) -> Double.compare(b.activity, a.activity));
 
-        List<ID83Response.CosmicContribution> contributions = new ArrayList<>();
-        List<ID83Response.BiologicalAnnotation> annotations = new ArrayList<>();
+        List<ID83Response.SignatureContribution> signatureContributions = new ArrayList<>();
+
         StringBuilder summary = new StringBuilder();
 
         for (ExposureResult er : exposureResults) {
-            String etiology = ETIOLOGY_MAP.getOrDefault(er.signature, "Unknown");
-            contributions.add(new ID83Response.CosmicContribution(
-                    er.signature, round4(er.percentage), etiology));
-            annotations.add(new ID83Response.BiologicalAnnotation(
-                    er.signature, etiology, contributionLevel(er.percentage)));
-            if (summary.length() > 0) summary.append(". ");
+
+            String etiology =
+                    ETIOLOGY_MAP.getOrDefault(er.signature, "Unknown");
+
+            double contributionPercentage = round4(er.percentage);
+
+            String contributionLevel =
+                    contributionLevel(er.percentage);
+
+            signatureContributions.add(
+                    new ID83Response.SignatureContribution(
+                            er.signature,
+                            contributionPercentage,
+                            etiology,
+                            contributionLevel
+                    )
+            );
+
+            if (summary.length() > 0) {
+                summary.append(". ");
+            }
+
             summary.append(er.signature)
                     .append(" (")
-                    .append(String.format(Locale.US, "%.1f", er.percentage))
+                    .append(String.format(
+                            Locale.US,
+                            "%.1f",
+                            er.percentage))
                     .append("%): ")
                     .append(etiology);
         }
@@ -140,13 +159,12 @@ public class ID83SignatureService {
         }
 
         ID83Response response = new ID83Response();
-        response.setCosmicVersion("COSMIC v3.4 ID83 GRCh38");
+        response.setCosmicVersion("COSMIC v3.4 ID83 GRCh37");
         response.setTotalMutations(totalMutations);
         response.setId83Spectrum(build.matrix);
         response.setId83Percentage(percentage);
         response.setId83Grouped(buildGroupedPercentage(build.matrix, totalMutations));
-        response.setCosmicContributions(contributions);
-        response.setBiologicalAnnotations(annotations);
+        response.setSignatureContributions(signatureContributions);
         response.setClinicalSummary(summary.toString());
         response.setReconstructionCosine(cosine);
         response.setPearson(pearson);
