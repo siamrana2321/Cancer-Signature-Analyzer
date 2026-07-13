@@ -1,6 +1,7 @@
 package com.company.mutationsignature.service;
 
 import com.company.mutationsignature.model.ID83Response;
+import org.apache.commons.math3.linear.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -10,21 +11,38 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
-import java.util.stream.Collectors;
 
+/**
+ * ID83 mutational-signature service.
+ */
 @Service
 public class ID83SignatureService {
+
     private static final Logger log = LoggerFactory.getLogger(ID83SignatureService.class);
 
-    // Biological annotations (extend as needed)
+    private static final String GENOME_PATH =
+            "D:\\horizondb\\resources\\refDB\\MutationSignatureDB\\genome\\GRCh38.fa";
+
+    private static final String COSMIC_PATH =
+            "D:\\horizondb\\resources\\refDB\\MutationSignatureDB\\cosmic\\COSMIC_v3.4_ID_GRCh37.txt";
+
+    private static final double NNLS_TOL = 1e-12;
+    private static final int NNLS_MAX_ITER = 10000;
+    private static final double NNLS_ADD_PENALTY = 0.05;
+    private static final double NNLS_REMOVE_PENALTY = 0.01;
+    private static final double INITIAL_REMOVE_PENALTY = 0.05;
+    private static final double MIN_ACTIVITY = 1e-8;
+    private static final double EPS = 1e-12;
+
     private static final Map<String, String> ETIOLOGY_MAP = new HashMap<>();
+
     static {
         ETIOLOGY_MAP.put("ID1", "Slippage during DNA replication of the replicated DNA strand");
-        ETIOLOGY_MAP.put("ID2", "Slippage during DNA replication of the replicated DNAs strand");
+        ETIOLOGY_MAP.put("ID2", "Slippage during DNA replication of the replicated DNA strand");
         ETIOLOGY_MAP.put("ID3", "Tobacco smoking");
         ETIOLOGY_MAP.put("ID4", "Unknown");
         ETIOLOGY_MAP.put("ID5", "Unknown");
-        ETIOLOGY_MAP.put("ID6", "Defective homologous recombination DNA damage repair");
+        ETIOLOGY_MAP.put("ID6", "Defective homologous recombination DNA repair");
         ETIOLOGY_MAP.put("ID7", "Defective DNA mismatch repair");
         ETIOLOGY_MAP.put("ID8", "Repair of DNA double strand breaks by NHEJ or mutations in TOP2A");
         ETIOLOGY_MAP.put("ID9", "Unknown");
@@ -45,591 +63,1695 @@ public class ID83SignatureService {
         ETIOLOGY_MAP.put("ID24", "Unknown");
         ETIOLOGY_MAP.put("ID25", "Unknown");
     }
-    private static final String GENOME_PATH =
-            "D:\\horizondb\\resources\\refDB\\MutationSignatureDB\\genome\\GRCh38.fa";
-    private static final String COSMIC_PATH =
-            "D:\\horizondb\\resources\\refDB\\MutationSignatureDB\\cosmic\\COSMIC_Human_ID-83_GRCh37_v3.6.tsv";
 
-    private static class Annotation {
-        String etiology, mechanism, association;
-        Annotation(String e, String m, String a) { etiology=e; mechanism=m; association=a; }
-    }
+    // -------------------------------------------------------------------------
+    // Public pipeline
+    // -------------------------------------------------------------------------
 
-    // ------------------- Main pipeline -------------------
     public ID83Response runPipeline(Path vcfPath) throws Exception {
-        log.info("Starting pipeline: VCF={}", vcfPath);
+        log.info("Starting ID83 pipeline: {}", vcfPath);
 
-        // 1. Load genome
-        Map<String, String> genome = loadGenome(Paths.get(GENOME_PATH));
-        log.info("Genome loaded: {} chromosomes", genome.size());
-
-        // 2. Build ID83 matrix from VCF
-        Map<String, Integer> matrix = buildMatrixFromVcf(vcfPath, genome);
-        log.info("Matrix built with {} categories", matrix.size());
-
-        // 3. Load COSMIC signatures
+        Genome genome = loadGenome(Paths.get(GENOME_PATH));
         CosmicData cosmic = loadCosmicSignatures(Paths.get(COSMIC_PATH));
-        log.info("COSMIC loaded: {} categories, {} signatures", cosmic.categories.size(), cosmic.signatureNames.size());
 
-        // 4. Align matrix with COSMIC order
-        double[] sampleVector = alignToCosmic(matrix, cosmic.categories);
-        long totalMutations = (long) Arrays.stream(sampleVector).sum();
-        if (totalMutations == 0) {
-            throw new IllegalArgumentException("Total mutations = 0. Check VCF and genome.");
+        validateCosmicChannels(cosmic.categories);
+
+        MatrixBuildResult build = buildMatrixFromVcf(vcfPath, genome);
+        double[] sample = alignToCosmic(build.matrix, cosmic.categories);
+        long totalMutations = Math.round(sum(sample));
+
+        if (totalMutations == 0L) {
+            throw new IllegalArgumentException(
+                    "No classifiable ID83 indels were found. " +
+                            "Input=" + build.totalAlleles +
+                            ", REF mismatch=" + build.skipReasons.get(SkipReason.REF_MISMATCH));
         }
 
-        // 5. NNLS fitting
-        double[] exposures = solveNNLS(cosmic.matrix, sampleVector, 2000, 1e-8);
+        FitResult fit = sparseRefit(cosmic.matrix, sample);
+        double[] reconstructed = multiply(cosmic.matrix, fit.exposures);
 
-        // 6. Reconstruct and compute metrics
-        double[] reconstructed = reconstruct(cosmic.matrix, exposures);
-        double cosSim = cosineSimilarity(sampleVector, reconstructed);
-        double pearson = computePearson(sampleVector, reconstructed);
+        double cosine = cosineSimilarity(sample, reconstructed);
+        double pearson = pearson(sample, reconstructed);
+        double l1 = l1(sample, reconstructed);
+        double l2 = l2(sample, reconstructed);
+        double l1Percent = 100.0 * l1 / Math.max(sum(sample), EPS);
+        double sampleL2 = vectorNorm(sample);
+        double l2Percent = 100.0 * l2 / Math.max(sampleL2, EPS);
+        double kl = klDivergence(normalize(sample), normalize(reconstructed));
 
-        // L1, L2, KL divergence
-        double l1Norm = computeL1Norm(sampleVector, reconstructed);
-        double l2Norm = computeL2Norm(sampleVector, reconstructed);
-        double l1NormPercent = (totalMutations > 0) ? 100.0 * l1Norm / totalMutations : 0.0;
-        double l2NormOriginal = Math.sqrt(Arrays.stream(sampleVector).map(v -> v*v).sum());
-        double l2NormPercent = (l2NormOriginal > 0) ? 100.0 * l2Norm / l2NormOriginal : 0.0;
+        List<ExposureResult> exposureResults = new ArrayList<>();
+        double totalActivity = sum(fit.exposures);
 
-        // KL divergence (normalize vectors)
-        double[] p = normalize(sampleVector);
-        double[] q = normalize(reconstructed);
-        double klDiv = computeKLDivergence(p, q);
-
-        // 7. Prepare exposure results, sort, take top 3
-        List<ExposureResult> allExposures = new ArrayList<>();
-        double totalExposure = Arrays.stream(exposures).sum();
-        for (int i = 0; i < exposures.length; i++) {
-            if (exposures[i] > 1e-6) {
-                double percent = (totalExposure > 0) ? 100.0 * exposures[i] / totalExposure : 0.0;
-                allExposures.add(new ExposureResult(cosmic.signatureNames.get(i), exposures[i], percent));
+        for (int i = 0; i < fit.exposures.length; i++) {
+            if (fit.exposures[i] > MIN_ACTIVITY) {
+                double pct = 100.0 * fit.exposures[i] / Math.max(totalActivity, EPS);
+                exposureResults.add(new ExposureResult(
+                        cosmic.signatureNames.get(i),
+                        fit.exposures[i],
+                        pct
+                ));
             }
         }
-        allExposures.sort((a, b) -> Double.compare(b.percent, a.percent));
-        List<ExposureResult> top3 = allExposures.stream().limit(3).collect(Collectors.toList());
 
-        // 8. Build contributions, annotations, and clinical summary from top 3
+        exposureResults.sort((a, b) -> Double.compare(b.activity, a.activity));
+
         List<ID83Response.CosmicContribution> contributions = new ArrayList<>();
-        List<ID83Response.BiologicalAnnotation> annotationsList = new ArrayList<>();
-        StringBuilder clinicalSummary = new StringBuilder();
+        List<ID83Response.BiologicalAnnotation> annotations = new ArrayList<>();
+        StringBuilder summary = new StringBuilder();
 
-        for (ExposureResult er : top3) {
-            String sig = er.signature;
-            double percentRounded = round4(er.percent);
-//            Annotation ann = ANNOTATIONS.getOrDefault(sig, new Annotation("Unknown", "Unknown", "Unknown"));
-            String etiology = ETIOLOGY_MAP.getOrDefault(sig, "Unknown");
-
-            // Confidence based on percentage threshold (as in SBS96)
-            String confidence;
-            if (percentRounded >= 20.0) {
-                confidence = "High";
-            } else if (percentRounded >= 5.0) {
-                confidence = "Moderate";
-            } else {
-                confidence = "Low";
-            }
-
-            contributions.add(new ID83Response.CosmicContribution(sig, percentRounded, etiology));
-            annotationsList.add(new ID83Response.BiologicalAnnotation(sig, etiology, confidence));
-
-            if (clinicalSummary.length() > 0) clinicalSummary.append(". ");
-            clinicalSummary.append(sig).append(" (").append(String.format("%.1f", percentRounded)).append("%) : ").append(etiology);
+        for (ExposureResult er : exposureResults) {
+            String etiology = ETIOLOGY_MAP.getOrDefault(er.signature, "Unknown");
+            contributions.add(new ID83Response.CosmicContribution(
+                    er.signature, round4(er.percentage), etiology));
+            annotations.add(new ID83Response.BiologicalAnnotation(
+                    er.signature, etiology, contributionLevel(er.percentage)));
+            if (summary.length() > 0) summary.append(". ");
+            summary.append(er.signature)
+                    .append(" (")
+                    .append(String.format(Locale.US, "%.1f", er.percentage))
+                    .append("%): ")
+                    .append(etiology);
         }
 
-        // 9. Build id83Percentage map with rounded values (4 decimals)
-        Map<String, Double> percentageMap = new LinkedHashMap<>();
-        for (Map.Entry<String, Integer> entry : matrix.entrySet()) {
-            double pct = 100.0 * entry.getValue() / totalMutations;
-            percentageMap.put(entry.getKey(), round4(pct));
+        Map<String, Double> percentage = new LinkedHashMap<>();
+        for (String channel : canonicalId83Channels()) {
+            int count = build.matrix.get(channel);
+            percentage.put(channel, round4(100.0 * count / totalMutations));
         }
-        Map<String, Map<String, Double>> grouped = buildGroupedPercentage(matrix, totalMutations);
 
-
-        // 10. Build final response
         ID83Response response = new ID83Response();
-        response.setCosmicVersion("COSMIC v3.6 ID83 GRCh38");
+        response.setCosmicVersion("COSMIC v3.4 ID83 GRCh38");
         response.setTotalMutations(totalMutations);
-        response.setId83Spectrum(matrix);
-        response.setId83Percentage(percentageMap);
-        response.setId83Grouped(grouped);
+        response.setId83Spectrum(build.matrix);
+        response.setId83Percentage(percentage);
+        response.setId83Grouped(buildGroupedPercentage(build.matrix, totalMutations));
         response.setCosmicContributions(contributions);
-        response.setBiologicalAnnotations(annotationsList);
-        response.setClinicalSummary(clinicalSummary.toString());
-        response.setReconstructionCosine(cosSim);
+        response.setBiologicalAnnotations(annotations);
+        response.setClinicalSummary(summary.toString());
+        response.setReconstructionCosine(cosine);
         response.setPearson(pearson);
+        response.setL1Norm(l1);
+        response.setL1NormPercent(l1Percent);
+        response.setL2Norm(l2);
+        response.setL2NormPercent(l2Percent);
+        response.setKlDivergence(kl);
 
-        // Set new metrics
-        response.setL1Norm(l1Norm);
-        response.setL1NormPercent(l1NormPercent);
-        response.setL2Norm(l2Norm);
-        response.setL2NormPercent(l2NormPercent);
-        response.setKlDivergence(klDiv);
+        log.info(
+                "ID83 complete: records={}, alleles={}, classified={}, skipped={}, cosine={}, signatures={}",
+                build.totalRecords, build.totalAlleles, totalMutations,
+                build.totalAlleles - totalMutations, cosine, exposureResults.size());
 
-        log.info("Pipeline completed. Cosine = {}, Pearson = {}, L1_Norm% = {}", cosSim, pearson, l1NormPercent);
+        for (Map.Entry<SkipReason, Long> e : build.skipReasons.entrySet()) {
+            if (e.getValue() > 0L) {
+                log.info("ID83 skip reason {} = {}", e.getKey(), e.getValue());
+            }
+        }
+
         return response;
     }
 
-    // Helper to round to 4 decimal places
-    private double round4(double value) {
-        return Math.round(value * 10000.0) / 10000.0;
-    }
+    // -------------------------------------------------------------------------
+    // VCF -> normalized indels -> ID83 Profile
+    // -------------------------------------------------------------------------
 
-    // Normalize vector to sum to 1
-    private double[] normalize(double[] vector) {
-        double sum = 0.0;
-        for (double v : vector) sum += v;
-        if (sum == 0) throw new IllegalArgumentException("Cannot normalize zero vector");
-        double[] norm = new double[vector.length];
-        for (int i = 0; i < vector.length; i++) norm[i] = vector[i] / sum;
-        return norm;
-    }
+    private MatrixBuildResult buildMatrixFromVcf(Path vcfPath, Genome genome) throws Exception {
+        LinkedHashMap<String, Integer> matrix = initializeMatrix();
+        MatrixBuildResult result = new MatrixBuildResult(matrix);
 
-    // ------ Metrics computations ------
-    private double computeL1Norm(double[] a, double[] b) {
-        double sum = 0.0;
-        for (int i = 0; i < a.length; i++) {
-            sum += Math.abs(a[i] - b[i]);
-        }
-        return sum;
-    }
-
-    private double computeL2Norm(double[] a, double[] b) {
-        double sum = 0.0;
-        for (int i = 0; i < a.length; i++) {
-            double diff = a[i] - b[i];
-            sum += diff * diff;
-        }
-        return Math.sqrt(sum);
-    }
-
-    private double computeKLDivergence(double[] p, double[] q) {
-        double kl = 0.0;
-        for (int i = 0; i < p.length; i++) {
-            if (p[i] > 0 && q[i] > 0) {
-                kl += p[i] * Math.log(p[i] / q[i]);
-            }
-        }
-        return kl;
-    }
-
-    // ------------------- Private helpers (unchanged from previous) -------------------
-    private Map<String, String> loadGenome(Path fastaPath) throws Exception {
-        Map<String, String> seqs = new LinkedHashMap<>();
-        try (BufferedReader reader = Files.newBufferedReader(fastaPath)) {
-            String line;
-            String currentChrom = null;
-            StringBuilder currentSeq = new StringBuilder();
-            while ((line = reader.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty()) continue;
-                if (line.startsWith(">")) {
-                    if (currentChrom != null) {
-                        seqs.put(currentChrom, currentSeq.toString());
-                    }
-                    String[] parts = line.substring(1).trim().split("\\s+");
-                    currentChrom = parts[0];
-                    currentSeq = new StringBuilder();
-                } else {
-                    currentSeq.append(line);
-                }
-            }
-            if (currentChrom != null) {
-                seqs.put(currentChrom, currentSeq.toString());
-            }
-        }
-        return seqs;
-    }
-
-    private Map<String, Integer> buildMatrixFromVcf(Path vcfPath, Map<String, String> genome) throws Exception {
-        Map<String, Integer> matrix = initializeMatrix();
         try (BufferedReader reader = Files.newBufferedReader(vcfPath)) {
             String line;
+
             while ((line = reader.readLine()) != null) {
-                if (line.startsWith("#")) continue;
-                String[] cols = line.split("\t");
-                if (cols.length < 5) continue;
-                String chrom = cols[0];
-                int pos = Integer.parseInt(cols[1]);
-                String ref = cols[3];
-                String alt = cols[4];
-                String category = classifyVariant(genome, chrom, pos, ref, alt);
-                if (category != null) {
-                    matrix.merge(category, 1, Integer::sum);
+                if (line.isEmpty() || line.charAt(0) == '#') {
+                    continue;
                 }
+
+                result.totalRecords++;
+
+                String[] cols = line.split("\t", -1);
+                if (cols.length < 5) {
+                    increment(result, SkipReason.MALFORMED_RECORD);
+                    continue;
+                }
+
+                String chrom = genome.resolveChromosome(cols[0]);
+                if (chrom == null) {
+                    increment(result, SkipReason.CHROMOSOME_NOT_FOUND);
+                    continue;
+                }
+
+                final int pos1;
+                try {
+                    pos1 = Integer.parseInt(cols[1]);
+                } catch (NumberFormatException ex) {
+                    increment(result, SkipReason.MALFORMED_RECORD);
+                    continue;
+                }
+
+                String ref = cols[3].toUpperCase(Locale.ROOT);
+                String altField = cols[4].toUpperCase(Locale.ROOT);
+
+                if (altField.contains(",")) {
+                    result.totalAlleles++;
+                    increment(result, SkipReason.MULTIALLELIC);
+                    continue;
+                }
+
+                String alt = altField;
+                result.totalAlleles++;
+
+                if (!isSequenceAllele(ref) || !isSequenceAllele(alt)) {
+                    increment(result, SkipReason.SYMBOLIC_OR_INVALID_ALLELE);
+                    continue;
+                }
+
+                if (ref.length() == alt.length()) {
+                    increment(result, SkipReason.NOT_INDEL);
+                    continue;
+                }
+
+                NormalizedIndel indel = normalizeIndel(
+                        chrom, pos1, ref, alt, genome.sequence(chrom));
+
+                if (indel == null || indel.deleted.length() == indel.inserted.length()) {
+                    increment(result, SkipReason.COMPLEX_VARIANT);
+                    continue;
+                }
+
+                if (!validateReference(indel, genome.sequence(chrom))) {
+                    increment(result, SkipReason.REF_MISMATCH);
+                    continue;
+                }
+
+                String channel = classifyId83(indel, genome.sequence(chrom));
+
+                if (channel == null || !matrix.containsKey(channel)) {
+                    increment(result, SkipReason.UNCLASSIFIED);
+                    continue;
+                }
+
+                matrix.put(channel, matrix.get(channel) + 1);
             }
         }
+
+        return result;
+    }
+
+    private NormalizedIndel normalizeIndel(
+            String chrom, int pos1, String rawRef, String rawAlt, String chromosome) {
+
+        int start0 = pos1 - 1;
+        String ref = rawRef;
+        String alt = rawAlt;
+
+        while (ref.length() > 1 && alt.length() > 1
+                && ref.charAt(ref.length() - 1) == alt.charAt(alt.length() - 1)) {
+            ref = ref.substring(0, ref.length() - 1);
+            alt = alt.substring(0, alt.length() - 1);
+        }
+
+        int prefix = 0;
+        int min = Math.min(ref.length(), alt.length());
+        while (prefix < min && ref.charAt(prefix) == alt.charAt(prefix)) {
+            prefix++;
+        }
+
+        start0 += prefix;
+        ref = ref.substring(prefix);
+        alt = alt.substring(prefix);
+
+        if (!ref.isEmpty() && !alt.isEmpty()) {
+            return null;
+        }
+
+        String deleted = ref;
+        String inserted = alt;
+
+        if (!deleted.isEmpty()) {
+            while (start0 > 0) {
+                char previous = chromosome.charAt(start0 - 1);
+                char last = deleted.charAt(deleted.length() - 1);
+                if (previous != last) {
+                    break;
+                }
+                deleted = previous + deleted.substring(0, deleted.length() - 1);
+                start0--;
+            }
+        } else if (!inserted.isEmpty()) {
+            while (start0 > 0) {
+                char previous = chromosome.charAt(start0 - 1);
+                char last = inserted.charAt(inserted.length() - 1);
+                if (previous != last) {
+                    break;
+                }
+                inserted = previous + inserted.substring(0, inserted.length() - 1);
+                start0--;
+            }
+        }
+
+        return new NormalizedIndel(chrom, start0, deleted, inserted);
+    }
+
+    private boolean validateReference(NormalizedIndel indel, String chromosome) {
+        if (indel.deleted.isEmpty()) {
+            return indel.start0 >= 0 && indel.start0 <= chromosome.length();
+        }
+
+        int end = indel.start0 + indel.deleted.length();
+        return indel.start0 >= 0
+                && end <= chromosome.length()
+                && chromosome.substring(indel.start0, end).equals(indel.deleted);
+    }
+
+    private String classifyId83(NormalizedIndel indel, String chromosome) {
+        if (indel.isDeletion()) {
+            return classifyDeletion(indel, chromosome);
+        }
+
+        if (indel.isInsertion()) {
+            return classifyInsertion(indel, chromosome);
+        }
+
+        return null;
+    }
+
+    private String classifyDeletion(NormalizedIndel indel, String chromosome) {
+        String deleted = indel.deleted;
+        int eventLength = deleted.length();
+
+        if (eventLength == 1) {
+            char base = pyrimidineClass(deleted.charAt(0));
+            int repeatUnits = homopolymerRepeatUnits(
+                    chromosome, indel.start0, deleted.charAt(0), true);
+            int repeatClass = cap(repeatUnits - 1, 0, 5);
+            return "1:Del:" + base + ":" + repeatClass;
+        }
+
+        int repeatUnits = tandemRepeatUnits(
+                chromosome, indel.start0, deleted, true);
+
+        if (repeatUnits > 1) {
+            return Math.min(eventLength, 5)
+                    + ":Del:R:"
+                    + cap(repeatUnits - 1, 0, 5);
+        }
+
+        int microhomology = deletionJunctionMicrohomology(indel, chromosome);
+
+        if (microhomology > 0) {
+            int lengthClass = Math.min(eventLength, 5);
+            int maxMhForClass = lengthClass == 2 ? 1
+                    : lengthClass == 3 ? 2
+                    : lengthClass == 4 ? 3 : 5;
+            int mhClass = Math.min(microhomology, maxMhForClass);
+            return lengthClass + ":Del:M:" + mhClass;
+        }
+
+        return Math.min(eventLength, 5) + ":Del:R:0";
+    }
+
+    private String classifyInsertion(NormalizedIndel indel, String chromosome) {
+        String inserted = indel.inserted;
+        int eventLength = inserted.length();
+
+        if (eventLength == 1) {
+            char base = pyrimidineClass(inserted.charAt(0));
+            int repeatUnits = insertionRepeatUnits(
+                    chromosome, indel.start0, inserted);
+            int repeatClass = cap(repeatUnits, 0, 5);
+            return "1:Ins:" + base + ":" + repeatClass;
+        }
+
+        int repeatUnits = insertionRepeatUnits(
+                chromosome, indel.start0, inserted);
+
+        return Math.min(eventLength, 5)
+                + ":Ins:R:"
+                + cap(repeatUnits, 0, 5);
+    }
+
+    private int homopolymerRepeatUnits(
+            String chromosome, int start0, char base, boolean deletion) {
+
+        int left = start0 - 1;
+        int right = deletion ? start0 + 1 : start0;
+        int count = 1;
+
+        while (left >= 0 && chromosome.charAt(left) == base) {
+            count++;
+            left--;
+        }
+
+        while (right < chromosome.length() && chromosome.charAt(right) == base) {
+            count++;
+            right++;
+        }
+
+        return count;
+    }
+
+    private int tandemRepeatUnits(
+            String chromosome, int start0, String unit, boolean deletion) {
+
+        int length = unit.length();
+        int copies = 1;
+
+        int p = start0 - length;
+        while (p >= 0 && chromosome.substring(p, p + length).equals(unit)) {
+            copies++;
+            p -= length;
+        }
+
+        p = deletion ? start0 + length : start0;
+        while (p + length <= chromosome.length()
+                && chromosome.substring(p, p + length).equals(unit)) {
+            copies++;
+            p += length;
+        }
+
+        return copies;
+    }
+
+    private int insertionRepeatUnits(String chromosome, int start0, String unit) {
+        int length = unit.length();
+        int copies = 0;
+
+        int p = start0 - length;
+        while (p >= 0 && chromosome.substring(p, p + length).equals(unit)) {
+            copies++;
+            p -= length;
+        }
+
+        p = start0;
+        while (p + length <= chromosome.length()
+                && chromosome.substring(p, p + length).equals(unit)) {
+            copies++;
+            p += length;
+        }
+
+        return copies;
+    }
+
+    private int deletionJunctionMicrohomology(
+            NormalizedIndel indel, String chromosome) {
+
+        int start = indel.start0;
+        int deletionLength = indel.deleted.length();
+        int end = start + deletionLength;
+        int maxMicrohomology = Math.min(deletionLength - 1, 5);
+
+        int forwardMh = 0;
+        for (int i = 0; i < maxMicrohomology; i++) {
+            int rightIndex = end + i;
+            if (rightIndex >= chromosome.length()) {
+                break;
+            }
+            if (indel.deleted.charAt(i) != chromosome.charAt(rightIndex)) {
+                break;
+            }
+            forwardMh++;
+        }
+
+        int reverseMh = 0;
+        for (int i = 0; i < maxMicrohomology; i++) {
+            int deletedIndex = deletionLength - 1 - i;
+            int leftIndex = start - 1 - i;
+            if (leftIndex < 0) {
+                break;
+            }
+            if (indel.deleted.charAt(deletedIndex) != chromosome.charAt(leftIndex)) {
+                break;
+            }
+            reverseMh++;
+        }
+
+        return Math.max(forwardMh, reverseMh);
+    }
+
+    private char pyrimidineClass(char base) {
+        switch (base) {
+            case 'C':
+            case 'G':
+                return 'C';
+            case 'A':
+            case 'T':
+                return 'T';
+            default:
+                throw new IllegalArgumentException("Unexpected DNA base: " + base);
+        }
+    }
+
+    private boolean isSequenceAllele(String allele) {
+        if (allele == null || allele.isEmpty() || allele.equals(".")) {
+            return false;
+        }
+
+        for (int i = 0; i < allele.length(); i++) {
+            char c = allele.charAt(i);
+            if (c != 'A' && c != 'C' && c != 'G' && c != 'T') {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // Canonical ID83 channels
+    // -------------------------------------------------------------------------
+
+    private LinkedHashMap<String, Integer> initializeMatrix() {
+        LinkedHashMap<String, Integer> matrix = new LinkedHashMap<>();
+
+        for (String channel : canonicalId83Channels()) {
+            matrix.put(channel, 0);
+        }
+
+        if (matrix.size() != 83) {
+            throw new IllegalStateException(
+                    "Internal ID83 channel definition contains " + matrix.size() + " channels");
+        }
+
         return matrix;
     }
 
-    private Map<String, Integer> initializeMatrix() {
-        Map<String, Integer> matrix = new LinkedHashMap<>();
+    private List<String> canonicalId83Channels() {
+        List<String> channels = new ArrayList<>(83);
+
         for (String op : Arrays.asList("Del", "Ins")) {
             for (String base : Arrays.asList("C", "T")) {
-                for (int r = 0; r <= 5; r++) {
-                    matrix.put("1:" + op + ":" + base + ":" + r, 0);
+                for (int repeat = 0; repeat <= 5; repeat++) {
+                    channels.add("1:" + op + ":" + base + ":" + repeat);
                 }
             }
         }
-        for (int L : Arrays.asList(2, 3, 4, 5)) {
+
+        for (int length = 2; length <= 5; length++) {
             for (String op : Arrays.asList("Del", "Ins")) {
-                for (int r = 0; r <= 5; r++) {
-                    matrix.put(L + ":" + op + ":R:" + r, 0);
+                for (int repeat = 0; repeat <= 5; repeat++) {
+                    channels.add(length + ":" + op + ":R:" + repeat);
                 }
             }
         }
-        matrix.put("2:Del:M:1", 0);
-        matrix.put("3:Del:M:1", 0);
-        matrix.put("3:Del:M:2", 0);
-        matrix.put("4:Del:M:1", 0);
-        matrix.put("4:Del:M:2", 0);
-        matrix.put("4:Del:M:3", 0);
+
+        channels.add("2:Del:M:1");
+        channels.add("3:Del:M:1");
+        channels.add("3:Del:M:2");
+        channels.add("4:Del:M:1");
+        channels.add("4:Del:M:2");
+        channels.add("4:Del:M:3");
+
         for (int mh = 1; mh <= 5; mh++) {
-            matrix.put("5:Del:M:" + mh, 0);
+            channels.add("5:Del:M:" + mh);
         }
-        return matrix;
+
+        return channels;
     }
 
-    private String classifyVariant(Map<String, String> genome, String chrom, int pos, String ref, String alt) {
-        if (!genome.containsKey(chrom)) {
-            if (!chrom.startsWith("chr")) {
-                chrom = "chr" + chrom;
+    private void validateCosmicChannels(List<String> categories) {
+        Set<String> expected = new LinkedHashSet<>(canonicalId83Channels());
+        Set<String> actual = new LinkedHashSet<>(categories);
+
+        if (categories.size() != 83 || !expected.equals(actual)) {
+            Set<String> missing = new LinkedHashSet<>(expected);
+            missing.removeAll(actual);
+
+            Set<String> unexpected = new LinkedHashSet<>(actual);
+            unexpected.removeAll(expected);
+
+            throw new IllegalArgumentException(
+                    "COSMIC ID83 categories do not match canonical 83 channels. " +
+                            "Rows=" + categories.size() +
+                            ", missing=" + missing +
+                            ", unexpected=" + unexpected);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SigProfilerAssignment-compatible sparse assignment
+    // -------------------------------------------------------------------------
+
+    private FitResult sparseRefit(double[][] signatures, double[] sample) {
+        LinkedHashSet<Integer> all = new LinkedHashSet<>();
+        for (int i = 0; i < signatures[0].length; i++) {
+            all.add(i);
+        }
+
+        // single_sample.fit_signatures(...): NNLS -> normalize to mutation count
+        // -> roundConserveSum.
+        double[] initial = fitSubsetConserveMutations(signatures, sample, all);
+
+        // Initial backward elimination uses initial_remove_penalty.
+        initial = removeAllSingleSignatures(
+                signatures, sample, initial, INITIAL_REMOVE_PENALTY);
+
+        LinkedHashSet<Integer> background = positiveIndices(initial);
+
+        double originalDistance = Double.POSITIVE_INFINITY;
+        double[] finalActivities = initial;
+
+        while (true) {
+            double layerBestDistance = Double.POSITIVE_INFINITY;
+            double[] layerBestActivities = null;
+
+            for (int candidate = 0; candidate < signatures[0].length; candidate++) {
+                if (background.contains(candidate)) {
+                    continue;
+                }
+
+                AddResult add = addSingleSignatureSigProfiler(
+                        signatures,
+                        sample,
+                        background,
+                        candidate,
+                        NNLS_ADD_PENALTY);
+
+                double[] removed = removeAllSingleSignatures(
+                        signatures,
+                        sample,
+                        add.exposures,
+                        NNLS_REMOVE_PENALTY);
+
+                double removeDistance = normalizedL2Distance(
+                        sample, multiply(signatures, removed));
+
+                boolean sameCompositionAccordingToSigProfiler =
+                        sigProfilerCompositionCheck(add.exposures, removed);
+
+                double[] activities = sameCompositionAccordingToSigProfiler
+                        ? add.exposures
+                        : removed;
+
+                double distance = sameCompositionAccordingToSigProfiler
+                        ? add.distance
+                        : removeDistance;
+
+                if (distance < layerBestDistance) {
+                    layerBestDistance = distance;
+                    layerBestActivities = activities;
+                }
+            }
+
+            if (layerBestActivities != null
+                    && layerBestDistance < originalDistance) {
+                originalDistance = layerBestDistance;
+                finalActivities = layerBestActivities;
+                background = positiveIndices(finalActivities);
+            } else {
+                break;
             }
         }
-        if (!genome.containsKey(chrom)) return null;
-        ref = ref.toUpperCase();
-        alt = alt.toUpperCase();
-        String seq = genome.get(chrom);
 
-        int lenRef = ref.length(), lenAlt = alt.length();
-        String mutType;
-        if (lenRef - lenAlt == lenRef - 1) mutType = "Del";
-        else if (lenAlt - lenRef == lenAlt - 1) mutType = "Ins";
-        else return null;
+        finalActivities = roundConserveSum(
+                finalActivities, Math.round(sum(sample)));
 
-        if (mutType.equals("Del")) {
-            String typeSeq = ref.substring(1);
-            int typeLen = typeSeq.length();
-            String sequence = typeSeq;
+        return new FitResult(
+                finalActivities,
+                positiveIndices(finalActivities));
+    }
 
-            int posRev = pos;
-            String actualSeq = "";
-            int start0 = posRev - typeLen;
-            if (start0 >= 1) actualSeq = seq.substring(start0, posRev);
-            while (posRev - typeLen > 0 && actualSeq.equals(typeSeq)) {
-                sequence = actualSeq + sequence;
-                posRev -= typeLen;
-                int newStart = posRev - typeLen;
-                if (newStart >= 1) actualSeq = seq.substring(newStart, posRev);
-                else actualSeq = "";
+    private AddResult addSingleSignatureSigProfiler(
+            double[][] signatures,
+            double[] sample,
+            Set<Integer> present,
+            int candidate,
+            double cutoff) {
+
+        LinkedHashSet<Integer> current = new LinkedHashSet<>(present);
+
+        double originalDistance = Double.POSITIVE_INFINITY;
+        double[] originalExposure = new double[signatures[0].length];
+
+        if (!current.isEmpty()) {
+            SubsetFit originalFit =
+                    fitSubsetForAdd(signatures, sample, current);
+            originalExposure = originalFit.exposures;
+            originalDistance = originalFit.rawDistance;
+        }
+
+        LinkedHashSet<Integer> trial = new LinkedHashSet<>(current);
+        trial.add(candidate);
+
+        SubsetFit trialFit = fitSubsetForAdd(signatures, sample, trial);
+
+        if (originalDistance - trialFit.rawDistance > cutoff) {
+            return new AddResult(
+                    trialFit.exposures,
+                    trialFit.rawDistance);
+        }
+
+        return new AddResult(originalExposure, originalDistance);
+    }
+
+    private SubsetFit fitSubsetForAdd(
+            double[][] fullMatrix,
+            double[] sample,
+            Set<Integer> active) {
+
+        int signatureCount = fullMatrix[0].length;
+        double[] fullExposure = new double[signatureCount];
+
+        if (active.isEmpty()) {
+            return new SubsetFit(
+                    fullExposure,
+                    Double.POSITIVE_INFINITY);
+        }
+
+        List<Integer> indices = new ArrayList<>(active);
+        Collections.sort(indices);
+
+        double[][] subset =
+                new double[fullMatrix.length][indices.size()];
+
+        for (int row = 0; row < fullMatrix.length; row++) {
+            for (int col = 0; col < indices.size(); col++) {
+                subset[row][col] =
+                        fullMatrix[row][indices.get(col)];
+            }
+        }
+
+        double[] rawWeights = solveNnls(subset, sample);
+        double[] rawReconstruction = multiply(subset, rawWeights);
+        double rawDistance =
+                normalizedL2Distance(sample, rawReconstruction);
+
+        double[] normalized = normalizeExposureToMutationCount(
+                rawWeights, sum(sample));
+
+        // np.round(...) + correction of the largest coefficient.
+        double[] rounded = numpyRoundAndConserve(
+                normalized, Math.round(sum(sample)));
+
+        for (int i = 0; i < indices.size(); i++) {
+            fullExposure[indices.get(i)] = rounded[i];
+        }
+
+        return new SubsetFit(fullExposure, rawDistance);
+    }
+
+    private double[] removeAllSingleSignatures(
+            double[][] signatures,
+            double[] sample,
+            double[] exposures,
+            double cutoff) {
+
+        double[] oldExposures =
+                roundConserveSum(exposures, Math.round(sum(sample)));
+
+        LinkedHashSet<Integer> current = positiveIndices(oldExposures);
+
+        if (current.size() <= 1) {
+            return oldExposures;
+        }
+
+        double[] baseFit =
+                fitSubsetRaw(signatures, sample, current);
+
+        double originalDistance = normalizedL2Distance(
+                sample, multiply(signatures, baseFit));
+
+        double[] successful = null;
+
+        while (current.size() > 1) {
+            double bestDifference = Double.POSITIVE_INFINITY;
+            double bestDistance = Double.POSITIVE_INFINITY;
+            double[] bestExposure = null;
+
+            for (Integer candidate : new ArrayList<>(current)) {
+                LinkedHashSet<Integer> trial =
+                        new LinkedHashSet<>(current);
+                trial.remove(candidate);
+
+                if (trial.isEmpty()) {
+                    continue;
+                }
+
+                double[] trialRaw =
+                        fitSubsetRaw(signatures, sample, trial);
+
+                double trialDistance = normalizedL2Distance(
+                        sample, multiply(signatures, trialRaw));
+
+                double difference =
+                        trialDistance - originalDistance;
+
+                if (difference < 0.0) {
+                    difference = cutoff + 1e-100;
+                }
+
+                if (difference < bestDifference) {
+                    bestDifference = difference;
+                    bestDistance = trialDistance;
+                    bestExposure =
+                            normalizeExposureToMutationCount(
+                                    trialRaw, sum(sample));
+                }
             }
 
-            int posForward = pos + typeLen;
-            String newSeq = "";
-            if (posForward + typeLen <= seq.length()) {
-                newSeq = seq.substring(posForward, posForward + typeLen);
-            }
-            while (newSeq.equals(typeSeq)) {
-                sequence += newSeq;
-                posForward += typeLen;
-                if (posForward + typeLen <= seq.length()) {
-                    newSeq = seq.substring(posForward, posForward + typeLen);
-                } else newSeq = "";
+            if (bestExposure == null || bestDifference > cutoff) {
+                break;
             }
 
-            if (typeLen > 1 && sequence.length() == typeLen) {
-                String forwardHom = ref.substring(1, ref.length() - 1);
-                String reverseHom = ref.substring(2);
-                int forHom = 0, revHom = 0;
-                String forSeq = "", revSeq = "";
+            successful = bestExposure;
+            current = positiveIndices(successful);
+            originalDistance = bestDistance;
 
-                int p = pos + typeLen;
-                for (int i = forwardHom.length(); i >= 1; i--) {
-                    if (p + i <= seq.length()) {
-                        String sub = seq.substring(p, p + i);
-                        if (sub.equals(forwardHom.substring(0, i))) {
-                            forSeq = forwardHom.substring(0, i);
-                            forHom = forSeq.length();
-                            break;
+            if (current.size() <= 1) {
+                break;
+            }
+        }
+
+        if (successful == null) {
+            return oldExposures;
+        }
+
+        return successful;
+    }
+
+    private double[] fitSubsetRaw(
+            double[][] fullMatrix,
+            double[] sample,
+            Set<Integer> active) {
+
+        int signatureCount = fullMatrix[0].length;
+        double[] fullExposure = new double[signatureCount];
+
+        if (active.isEmpty()) {
+            return fullExposure;
+        }
+
+        List<Integer> indices = new ArrayList<>(active);
+        Collections.sort(indices);
+
+        double[][] subset =
+                new double[fullMatrix.length][indices.size()];
+
+        for (int row = 0; row < fullMatrix.length; row++) {
+            for (int col = 0; col < indices.size(); col++) {
+                subset[row][col] =
+                        fullMatrix[row][indices.get(col)];
+            }
+        }
+
+        double[] subsetExposure = solveNnls(subset, sample);
+
+        for (int i = 0; i < indices.size(); i++) {
+            fullExposure[indices.get(i)] = subsetExposure[i];
+        }
+
+        return fullExposure;
+    }
+
+    private double[] fitSubsetConserveMutations(
+            double[][] fullMatrix,
+            double[] sample,
+            Set<Integer> active) {
+
+        double[] raw = fitSubsetRaw(fullMatrix, sample, active);
+        double[] normalized =
+                normalizeExposureToMutationCount(raw, sum(sample));
+
+        return roundConserveSum(
+                normalized, Math.round(sum(sample)));
+    }
+
+    private double[] normalizeExposureToMutationCount(
+            double[] exposure,
+            double mutationCount) {
+
+        double total = sum(exposure);
+        double[] result = new double[exposure.length];
+
+        if (total <= EPS) {
+            return result;
+        }
+
+        for (int i = 0; i < exposure.length; i++) {
+            result[i] =
+                    exposure[i] / total * mutationCount;
+        }
+
+        return result;
+    }
+
+    private double[] numpyRoundAndConserve(
+            double[] values,
+            long targetTotal) {
+
+        double[] result = new double[values.length];
+
+        for (int i = 0; i < values.length; i++) {
+            result[i] = Math.rint(Math.max(0.0, values[i]));
+        }
+
+        long difference =
+                targetTotal - Math.round(sum(result));
+
+        if (difference != 0L && result.length > 0) {
+            int maxIndex = indexOfMaximum(result);
+            result[maxIndex] += difference;
+        }
+
+        return result;
+    }
+
+    private boolean sigProfilerCompositionCheck(
+            double[] a,
+            double[] b) {
+
+        List<Integer> ai = positiveIndexList(a);
+        List<Integer> bi = positiveIndexList(b);
+
+        return ai.size() == bi.size()
+                && numpyAllOfIndices(ai) == numpyAllOfIndices(bi);
+    }
+
+    private List<Integer> positiveIndexList(double[] exposures) {
+        List<Integer> result = new ArrayList<>();
+
+        for (int i = 0; i < exposures.length; i++) {
+            if (exposures[i] > MIN_ACTIVITY) {
+                result.add(i);
+            }
+        }
+
+        return result;
+    }
+
+    private boolean numpyAllOfIndices(List<Integer> indices) {
+        // np.all(empty integer array) is True.
+        for (Integer index : indices) {
+            if (index == 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private double[] roundConserveSum(
+            double[] values,
+            long targetTotal) {
+
+        double[] result = new double[values.length];
+        List<Integer> order = new ArrayList<>();
+
+        long ceilTotal = 0L;
+
+        for (int i = 0; i < values.length; i++) {
+            result[i] = Math.ceil(Math.max(0.0, values[i]));
+            ceilTotal += Math.round(result[i]);
+            order.add(i);
+        }
+
+        Collections.sort(order, new Comparator<Integer>() {
+            @Override
+            public int compare(Integer a, Integer b) {
+                double residualA = values[a] - result[a];
+                double residualB = values[b] - result[b];
+                return Double.compare(residualA, residualB);
+            }
+        });
+
+        long remove = ceilTotal - targetTotal;
+
+        for (int i = 0; i < remove && i < order.size(); i++) {
+            int index = order.get(i);
+            if (result[index] > 0.0) {
+                result[index] -= 1.0;
+            }
+        }
+
+        if (Math.round(sum(result)) != targetTotal) {
+            throw new IllegalStateException(
+                    "Mutation count not conserved during roundConserveSum");
+        }
+
+        return result;
+    }
+
+    private int indexOfMaximum(double[] values) {
+        int index = 0;
+
+        for (int i = 1; i < values.length; i++) {
+            if (values[i] > values[index]) {
+                index = i;
+            }
+        }
+
+        return index;
+    }
+
+    private double normalizedL2Distance(
+            double[] observed,
+            double[] reconstructed) {
+
+        return l2(observed, reconstructed)
+                / Math.max(vectorNorm(observed), EPS);
+    }
+
+    private LinkedHashSet<Integer> positiveIndices(
+            double[] exposures) {
+
+        LinkedHashSet<Integer> result = new LinkedHashSet<>();
+
+        for (int i = 0; i < exposures.length; i++) {
+            if (exposures[i] > MIN_ACTIVITY) {
+                result.add(i);
+            }
+        }
+
+        return result;
+    }
+
+    // -------------------------------------------------------------------------
+    // NNLS
+    // -------------------------------------------------------------------------
+
+    private double[] solveNnls(double[][] a, double[] b) {
+        int m = a.length;
+        int n = a[0].length;
+
+        boolean[] skipCol = new boolean[n];
+
+        for (int j = 0; j < n; j++) {
+            boolean allZero = true;
+
+            for (int i = 0; i < m; i++) {
+                if (Math.abs(a[i][j]) > EPS) {
+                    allZero = false;
+                    break;
+                }
+            }
+
+            skipCol[j] = allZero;
+        }
+
+        int nActive = 0;
+        for (boolean skip : skipCol) {
+            if (!skip) {
+                nActive++;
+            }
+        }
+
+        if (nActive == 0) {
+            return new double[n];
+        }
+
+        double[][] reduced = new double[m][nActive];
+        int[] columnMap = new int[nActive];
+
+        int reducedColumn = 0;
+
+        for (int j = 0; j < n; j++) {
+            if (!skipCol[j]) {
+                for (int i = 0; i < m; i++) {
+                    reduced[i][reducedColumn] = a[i][j];
+                }
+
+                columnMap[reducedColumn] = j;
+                reducedColumn++;
+            }
+        }
+
+        double[] reducedSolution =
+                nnlsLawsonHanson(reduced, b);
+
+        double[] solution = new double[n];
+
+        for (int i = 0; i < nActive; i++) {
+            solution[columnMap[i]] =
+                    Math.max(0.0, reducedSolution[i]);
+        }
+
+        return solution;
+    }
+
+    private double[] nnlsLawsonHanson(
+            double[][] a,
+            double[] b) {
+
+        int m = a.length;
+        int n = a[0].length;
+
+        double[] x = new double[n];
+        boolean[] passive = new boolean[n];
+        double[] w = new double[n];
+        double[] residual = new double[m];
+
+        computeResidualsAndW(a, b, x, residual, w);
+
+        int iteration = 0;
+
+        while (true) {
+            int entering = -1;
+            double maximumW = NNLS_TOL;
+
+            for (int j = 0; j < n; j++) {
+                if (!passive[j] && w[j] > maximumW) {
+                    maximumW = w[j];
+                    entering = j;
+                }
+            }
+
+            if (entering == -1) {
+                break;
+            }
+
+            passive[entering] = true;
+
+            while (true) {
+                List<Integer> passiveList = new ArrayList<>();
+
+                for (int j = 0; j < n; j++) {
+                    if (passive[j]) {
+                        passiveList.add(j);
+                    }
+                }
+
+                if (passiveList.isEmpty()) {
+                    break;
+                }
+
+                double[] z =
+                        solvePassiveLeastSquares(a, b, passiveList);
+
+                boolean allPositive = true;
+
+                for (double value : z) {
+                    if (value <= NNLS_TOL) {
+                        allPositive = false;
+                        break;
+                    }
+                }
+
+                if (allPositive) {
+                    Arrays.fill(x, 0.0);
+
+                    for (int k = 0; k < passiveList.size(); k++) {
+                        x[passiveList.get(k)] = z[k];
+                    }
+
+                    break;
+                }
+
+                double alpha = Double.POSITIVE_INFINITY;
+
+                for (int k = 0; k < passiveList.size(); k++) {
+                    int column = passiveList.get(k);
+
+                    if (z[k] <= NNLS_TOL) {
+                        double denominator = x[column] - z[k];
+
+                        if (denominator > NNLS_TOL) {
+                            alpha = Math.min(
+                                    alpha,
+                                    x[column] / denominator);
                         }
                     }
                 }
-                p = pos;
-                for (int i = reverseHom.length(); i >= 1; i--) {
-                    if (p - i >= 0) {
-                        String sub = seq.substring(p - i, p);
-                        if (sub.equals(reverseHom.substring(reverseHom.length() - i))) {
-                            revSeq = reverseHom.substring(reverseHom.length() - i);
-                            revHom = revSeq.length();
-                            break;
+
+                if (!Double.isFinite(alpha)) {
+                    for (int k = 0; k < passiveList.size(); k++) {
+                        if (z[k] <= NNLS_TOL) {
+                            int column = passiveList.get(k);
+                            passive[column] = false;
+                            x[column] = 0.0;
                         }
                     }
+
+                    continue;
                 }
-                if (forHom > 0 || revHom > 0) {
-                    if (forHom >= revHom) sequence += forSeq;
-                    else sequence = revSeq + sequence;
-                    int mhLen = Math.min(sequence.length() - typeLen, 5);
-                    int lenClass = Math.min(typeLen, 5);
-                    return lenClass + ":Del:M:" + mhLen;
+
+                for (int k = 0; k < passiveList.size(); k++) {
+                    int column = passiveList.get(k);
+                    x[column] +=
+                            alpha * (z[k] - x[column]);
+                }
+
+                for (int column : passiveList) {
+                    if (x[column] <= NNLS_TOL) {
+                        passive[column] = false;
+                        x[column] = 0.0;
+                    }
                 }
             }
 
-            int lenClass = Math.min(typeLen, 5);
-            int repeatClass = Math.min(sequence.length() / typeLen - 1, 5);
-            if (typeLen == 1) {
-                char base = typeSeq.charAt(0);
-                return "1:Del:" + ((base == 'C' || base == 'G') ? "C" : "T") + ":" + repeatClass;
-            } else {
-                return lenClass + ":Del:R:" + repeatClass;
+            computeResidualsAndW(a, b, x, residual, w);
+
+            iteration++;
+
+            if (iteration > NNLS_MAX_ITER) {
+                throw new IllegalStateException(
+                        "NNLS failed to converge within "
+                                + NNLS_MAX_ITER + " iterations");
             }
         }
 
-        else {
-            String typeSeq = alt.substring(1);
-            int typeLen = typeSeq.length();
-            String sequence = typeSeq;
-
-            int posRev = pos;
-            String subSeq = "";
-            if (posRev - typeLen >= 0) subSeq = seq.substring(posRev - typeLen, posRev);
-            while (posRev - typeLen > 0 && subSeq.equals(typeSeq)) {
-                sequence = subSeq + sequence;
-                posRev -= typeLen;
-                if (posRev - typeLen >= 0) subSeq = seq.substring(posRev - typeLen, posRev);
-                else subSeq = "";
-            }
-
-            int posForward = pos;
-            if (posForward + typeLen <= seq.length()) {
-                subSeq = seq.substring(posForward, posForward + typeLen);
-            } else subSeq = "";
-            while (subSeq.equals(typeSeq)) {
-                sequence += subSeq;
-                posForward += typeLen;
-                if (posForward + typeLen <= seq.length()) {
-                    subSeq = seq.substring(posForward, posForward + typeLen);
-                } else subSeq = "";
-            }
-
-            int repeatClass = Math.min(sequence.length() / typeLen - 1, 5);
-            int lenClass = Math.min(typeLen, 5);
-            if (typeLen == 1) {
-                char base = typeSeq.charAt(0);
-                return "1:Ins:" + ((base == 'C' || base == 'G') ? "C" : "T") + ":" + repeatClass;
-            } else {
-                return lenClass + ":Ins:R:" + repeatClass;
+        for (int j = 0; j < n; j++) {
+            if (x[j] < MIN_ACTIVITY) {
+                x[j] = 0.0;
             }
         }
+
+        return x;
+    }
+
+    private double[] solvePassiveLeastSquares(
+            double[][] a,
+            double[] b,
+            List<Integer> passiveList) {
+
+        int passiveCount = passiveList.size();
+
+        if (passiveCount == 0) {
+            return new double[0];
+        }
+
+        RealMatrix passiveMatrix =
+                new Array2DRowRealMatrix(a.length, passiveCount);
+
+        for (int i = 0; i < a.length; i++) {
+            for (int k = 0; k < passiveCount; k++) {
+                passiveMatrix.setEntry(
+                        i,
+                        k,
+                        a[i][passiveList.get(k)]);
+            }
+        }
+
+        RealVector target = new ArrayRealVector(b, false);
+
+        DecompositionSolver solver =
+                new QRDecomposition(passiveMatrix, 1e-15)
+                        .getSolver();
+
+        if (!solver.isNonSingular()) {
+            solver = new SingularValueDecomposition(passiveMatrix)
+                    .getSolver();
+        }
+
+        return solver.solve(target).toArray();
+    }
+
+    private void computeResidualsAndW(
+            double[][] a,
+            double[] b,
+            double[] x,
+            double[] residual,
+            double[] w) {
+
+        Arrays.fill(residual, 0.0);
+
+        for (int i = 0; i < a.length; i++) {
+            double fitted = 0.0;
+
+            for (int j = 0; j < a[0].length; j++) {
+                fitted += a[i][j] * x[j];
+            }
+
+            residual[i] = b[i] - fitted;
+        }
+
+        Arrays.fill(w, 0.0);
+
+        for (int j = 0; j < a[0].length; j++) {
+            double value = 0.0;
+
+            for (int i = 0; i < a.length; i++) {
+                value += a[i][j] * residual[i];
+            }
+
+            w[j] = value;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // FASTA / COSMIC
+    // -------------------------------------------------------------------------
+
+    private Genome loadGenome(Path fastaPath) throws Exception {
+        LinkedHashMap<String, String> sequences = new LinkedHashMap<>();
+
+        try (BufferedReader reader = Files.newBufferedReader(fastaPath)) {
+            String line;
+            String chromosome = null;
+            StringBuilder sequence = new StringBuilder();
+
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+
+                if (line.isEmpty()) {
+                    continue;
+                }
+
+                if (line.charAt(0) == '>') {
+                    if (chromosome != null) {
+                        sequences.put(chromosome, sequence.toString().toUpperCase(Locale.ROOT));
+                    }
+
+                    chromosome = line.substring(1).split("\\s+")[0];
+                    sequence = new StringBuilder();
+                } else {
+                    sequence.append(line);
+                }
+            }
+
+            if (chromosome != null) {
+                sequences.put(chromosome, sequence.toString().toUpperCase(Locale.ROOT));
+            }
+        }
+
+        if (sequences.isEmpty()) {
+            throw new IllegalArgumentException("No FASTA sequences loaded from " + fastaPath);
+        }
+
+        return new Genome(sequences);
     }
 
     private CosmicData loadCosmicSignatures(Path cosmicPath) throws Exception {
         try (BufferedReader reader = Files.newBufferedReader(cosmicPath)) {
             String header = reader.readLine();
-            if (header == null) throw new IllegalArgumentException("Empty COSMIC file");
-            String[] headers = header.split("\t");
-            List<String> sigNames = new ArrayList<>();
-            for (int i = 1; i < headers.length; i++) sigNames.add(headers[i].trim());
-            int nSig = sigNames.size();
+
+            if (header == null) {
+                throw new IllegalArgumentException("Empty COSMIC signature file");
+            }
+
+            String[] headerColumns = header.split("\t", -1);
+            List<String> signatures = new ArrayList<>();
+
+            for (int i = 1; i < headerColumns.length; i++) {
+                signatures.add(headerColumns[i].trim());
+            }
 
             List<String> categories = new ArrayList<>();
             List<double[]> rows = new ArrayList<>();
+
             String line;
+
             while ((line = reader.readLine()) != null) {
-                if (line.trim().isEmpty()) continue;
-                String[] cols = line.split("\t");
-                if (cols.length < 1 + nSig) continue;
-                categories.add(cols[0].trim());
-                double[] row = new double[nSig];
-                for (int i = 0; i < nSig; i++) row[i] = Double.parseDouble(cols[i+1].trim());
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+
+                String[] columns = line.split("\t", -1);
+
+                if (columns.length != signatures.size() + 1) {
+                    throw new IllegalArgumentException(
+                            "Invalid COSMIC row column count: " + line);
+                }
+
+                categories.add(columns[0].trim());
+
+                double[] row = new double[signatures.size()];
+
+                for (int i = 0; i < signatures.size(); i++) {
+                    row[i] = Double.parseDouble(columns[i + 1].trim());
+                }
+
                 rows.add(row);
             }
-            double[][] matrix = new double[rows.size()][nSig];
-            for (int i = 0; i < rows.size(); i++) matrix[i] = rows.get(i);
-            return new CosmicData(categories, sigNames, matrix);
+
+            double[][] matrix = new double[rows.size()][];
+
+            for (int i = 0; i < rows.size(); i++) {
+                matrix[i] = rows.get(i);
+            }
+
+            return new CosmicData(categories, signatures, matrix);
         }
     }
 
-    private static class CosmicData {
-        List<String> categories, signatureNames;
-        double[][] matrix;
-        CosmicData(List<String> c, List<String> s, double[][] m) { categories=c; signatureNames=s; matrix=m; }
-    }
+    private double[] alignToCosmic(
+            Map<String, Integer> matrix, List<String> cosmicCategories) {
 
-    private double[] alignToCosmic(Map<String, Integer> matrix, List<String> cosmicCategories) {
-        double[] vec = new double[cosmicCategories.size()];
+        double[] result = new double[cosmicCategories.size()];
+
         for (int i = 0; i < cosmicCategories.size(); i++) {
-            Integer count = matrix.get(cosmicCategories.get(i));
-            vec[i] = (count == null) ? 0.0 : count.doubleValue();
+            Integer value = matrix.get(cosmicCategories.get(i));
+
+            if (value == null) {
+                throw new IllegalArgumentException(
+                        "Missing ID83 channel: " + cosmicCategories.get(i));
+            }
+
+            result[i] = value.doubleValue();
         }
-        return vec;
+
+        return result;
     }
 
-    private double[] solveNNLS(double[][] A, double[] b, int maxIter, double tol) {
-        int m = A.length, n = A[0].length;
-        double[] x = new double[n];
-        Arrays.fill(x, 1.0);
+    // -------------------------------------------------------------------------
+    // Metrics
+    // -------------------------------------------------------------------------
 
-        for (int iter = 0; iter < maxIter; iter++) {
-            double[] Atb = new double[n];
-            double[] AtAx = new double[n];
-            for (int j = 0; j < n; j++) {
-                double sumB = 0.0, sumAx = 0.0;
-                for (int i = 0; i < m; i++) {
-                    sumB += A[i][j] * b[i];
-                    double ax = 0.0;
-                    for (int k = 0; k < n; k++) ax += A[i][k] * x[k];
-                    sumAx += A[i][j] * ax;
-                }
-                Atb[j] = sumB;
-                AtAx[j] = sumAx;
-            }
-            double maxChange = 0.0;
-            for (int j = 0; j < n; j++) {
-                double old = x[j];
-                if (AtAx[j] < 1e-15) x[j] = 0.0;
-                else x[j] = old * Atb[j] / AtAx[j];
-                if (Double.isNaN(x[j]) || Double.isInfinite(x[j])) x[j] = 0.0;
-                maxChange = Math.max(maxChange, Math.abs(x[j] - old));
-            }
-            if (maxChange < tol) break;
-        }
-        return x;
-    }
+    private double[] multiply(double[][] a, double[] x) {
+        double[] result = new double[a.length];
 
-    private double[] reconstruct(double[][] A, double[] x) {
-        double[] rec = new double[A.length];
-        for (int i = 0; i < A.length; i++) {
-            double sum = 0.0;
-            for (int j = 0; j < x.length; j++) sum += A[i][j] * x[j];
-            rec[i] = sum;
+        for (int row = 0; row < a.length; row++) {
+            double value = 0.0;
+
+            for (int col = 0; col < x.length; col++) {
+                value += a[row][col] * x[col];
+            }
+
+            result[row] = value;
         }
-        return rec;
+
+        return result;
     }
 
     private double cosineSimilarity(double[] a, double[] b) {
-        double dot = 0.0, na = 0.0, nb = 0.0;
+        double dot = 0.0;
+        double aa = 0.0;
+        double bb = 0.0;
+
         for (int i = 0; i < a.length; i++) {
             dot += a[i] * b[i];
-            na += a[i] * a[i];
-            nb += b[i] * b[i];
+            aa += a[i] * a[i];
+            bb += b[i] * b[i];
         }
-        if (na == 0 || nb == 0) return 0.0;
-        return dot / (Math.sqrt(na) * Math.sqrt(nb));
-    }
 
-//    private double computeRMSE(double[] observed, double[] reconstructed) {
-//        double sum = 0.0;
-//        for (int i = 0; i < observed.length; i++) {
-//            double diff = observed[i] - reconstructed[i];
-//            sum += diff * diff;
-//        }
-//        return Math.sqrt(sum / observed.length);
-//    }
-
-    private double computePearson(double[] x, double[] y) {
-        double meanX = Arrays.stream(x).average().orElse(0.0);
-        double meanY = Arrays.stream(y).average().orElse(0.0);
-        double num = 0.0, denX = 0.0, denY = 0.0;
-        for (int i = 0; i < x.length; i++) {
-            double dx = x[i] - meanX;
-            double dy = y[i] - meanY;
-            num += dx * dy;
-            denX += dx * dx;
-            denY += dy * dy;
+        if (aa <= EPS || bb <= EPS) {
+            return 0.0;
         }
-        if (denX == 0 || denY == 0) return 0.0;
-        return num / (Math.sqrt(denX) * Math.sqrt(denY));
+
+        return dot / (Math.sqrt(aa) * Math.sqrt(bb));
     }
 
-    private static class ExposureResult {
-        String signature;
-        double exposure;
-        double percent;
-        ExposureResult(String sig, double exp, double pct) { signature=sig; exposure=exp; percent=pct; }
+    private double pearson(double[] a, double[] b) {
+        double meanA = sum(a) / a.length;
+        double meanB = sum(b) / b.length;
+        double numerator = 0.0;
+        double da2 = 0.0;
+        double db2 = 0.0;
+
+        for (int i = 0; i < a.length; i++) {
+            double da = a[i] - meanA;
+            double db = b[i] - meanB;
+            numerator += da * db;
+            da2 += da * da;
+            db2 += db * db;
+        }
+
+        if (da2 <= EPS || db2 <= EPS) {
+            return 0.0;
+        }
+
+        return numerator / Math.sqrt(da2 * db2);
     }
+
+    private double l1(double[] a, double[] b) {
+        double result = 0.0;
+
+        for (int i = 0; i < a.length; i++) {
+            result += Math.abs(a[i] - b[i]);
+        }
+
+        return result;
+    }
+
+    private double l2(double[] a, double[] b) {
+        double result = 0.0;
+
+        for (int i = 0; i < a.length; i++) {
+            double d = a[i] - b[i];
+            result += d * d;
+        }
+
+        return Math.sqrt(result);
+    }
+
+    private double vectorNorm(double[] a) {
+        double value = 0.0;
+
+        for (double v : a) {
+            value += v * v;
+        }
+
+        return Math.sqrt(value);
+    }
+
+    private double[] normalize(double[] values) {
+        double total = sum(values);
+        double[] result = new double[values.length];
+
+        if (total <= EPS) {
+            return result;
+        }
+
+        for (int i = 0; i < values.length; i++) {
+            result[i] = values[i] / total;
+        }
+
+        return result;
+    }
+
+    private double klDivergence(double[] p, double[] q) {
+        double value = 0.0;
+
+        for (int i = 0; i < p.length; i++) {
+            if (p[i] <= 0.0) {
+                continue;
+            }
+
+            double pi = Math.max(p[i], EPS);
+            double qi = Math.max(q[i], EPS);
+            value += pi * Math.log(pi / qi);
+        }
+
+        return value;
+    }
+
+    private double sum(double[] values) {
+        double result = 0.0;
+
+        for (double value : values) {
+            result += value;
+        }
+
+        return result;
+    }
+
+    // -------------------------------------------------------------------------
+    // Response grouping
+    // -------------------------------------------------------------------------
 
     private Map<String, Map<String, Double>> buildGroupedPercentage(
-            Map<String, Integer> matrix,
-            long totalMutations
-    ) {
-        // Define the group order (matches the Python plot)
+            Map<String, Integer> matrix, long totalMutations) {
+
         List<String> groupOrder = Arrays.asList(
                 "1bp Deletion C", "1bp Deletion T",
                 "1bp Insertion C", "1bp Insertion T",
-                ">1bp Deletion 2", ">1bp Deletion 3", ">1bp Deletion 4", ">1bp Deletion 5+",
-                ">1bp Insertion 2", ">1bp Insertion 3", ">1bp Insertion 4", ">1bp Insertion 5+",
+                ">1bp Deletion 2", ">1bp Deletion 3",
+                ">1bp Deletion 4", ">1bp Deletion 5+",
+                ">1bp Insertion 2", ">1bp Insertion 3",
+                ">1bp Insertion 4", ">1bp Insertion 5+",
                 "MH 2", "MH 3", "MH 4", "MH 5+"
         );
 
-        Map<String, Map<String, Double>> grouped = new LinkedHashMap<>();
-        // Initialize empty maps for each group
+        Map<String, Map<String, Double>> grouped =
+                new LinkedHashMap<>();
+
         for (String group : groupOrder) {
             grouped.put(group, new LinkedHashMap<>());
         }
 
-        // Helper to add a value to a group with a sub-key
-        // sub-key is the repeat class or microhomology length (as string)
         for (Map.Entry<String, Integer> entry : matrix.entrySet()) {
-            String key = entry.getKey();
-            int count = entry.getValue();
-            double pct = (totalMutations > 0) ? 100.0 * count / totalMutations : 0.0;
-            pct = round4(pct); // round to 4 decimals
-
+            String[] parts = entry.getKey().split(":");
             String group = null;
-            String subKey = null;
+            String subKey = parts[3];
 
-            // 1bp deletions
-            if (key.matches("1:Del:[CT]:[0-5]")) {
-                String base = key.split(":")[2];
-                group = "1bp Deletion " + base;
-                subKey = key.split(":")[3];
-            }
-            // 1bp insertions
-            else if (key.matches("1:Ins:[CT]:[0-5]")) {
-                String base = key.split(":")[2];
-                group = "1bp Insertion " + base;
-                subKey = key.split(":")[3];
-            }
-            // >1bp deletions at repeats
-            else if (key.matches("[2-5]:Del:R:[0-5]")) {
-                String[] parts = key.split(":");
-                int length = Integer.parseInt(parts[0]);
-                String groupLength = (length == 5) ? "5+" : String.valueOf(length);
-                group = ">1bp Deletion " + groupLength;
-                subKey = parts[3];
-            }
-            // >1bp insertions at repeats
-            else if (key.matches("[2-5]:Ins:R:[0-5]")) {
-                String[] parts = key.split(":");
-                int length = Integer.parseInt(parts[0]);
-                String groupLength = (length == 5) ? "5+" : String.valueOf(length);
-                group = ">1bp Insertion " + groupLength;
-                subKey = parts[3];
-            }
-            // microhomology deletions
-            else if (key.matches("[2-5]:Del:M:[1-5]")) {
-                String[] parts = key.split(":");
-                int length = Integer.parseInt(parts[0]);
-                String groupLength = (length == 5) ? "5+" : String.valueOf(length);
-                group = "MH " + groupLength;
-                subKey = parts[3];
+            if ("1".equals(parts[0])) {
+                group = "Del".equals(parts[1])
+                        ? "1bp Deletion " + parts[2]
+                        : "1bp Insertion " + parts[2];
+            } else if ("R".equals(parts[2])) {
+                String length = "5".equals(parts[0]) ? "5+" : parts[0];
+                group = "Del".equals(parts[1])
+                        ? ">1bp Deletion " + length
+                        : ">1bp Insertion " + length;
+            } else if ("M".equals(parts[2])) {
+                String length = "5".equals(parts[0]) ? "5+" : parts[0];
+                group = "MH " + length;
             }
 
-            if (group != null && subKey != null) {
-                Map<String, Double> inner = grouped.get(group);
-                if (inner != null) {
-                    inner.put(subKey, pct);
-                } else {
-                    // If group not in order, still add it (shouldn't happen)
-                    Map<String, Double> newInner = new LinkedHashMap<>();
-                    newInner.put(subKey, pct);
-                    grouped.put(group, newInner);
-                }
+            if (group != null && grouped.containsKey(group)) {
+                double pct = 100.0 * entry.getValue() / Math.max(totalMutations, 1L);
+                grouped.get(group).put(subKey, round4(pct));
             }
         }
 
-        // Ensure all groups have at least an empty map (already done)
         return grouped;
+    }
+
+    private String contributionLevel(double percentage) {
+        if (percentage >= 20.0) {
+            return "Dominant";
+        }
+
+        if (percentage >= 5.0) {
+            return "Intermediate";
+        }
+
+        return "Minor";
+    }
+
+    private int cap(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private double round4(double value) {
+        return Math.round(value * 10000.0) / 10000.0;
+    }
+
+    private void increment(MatrixBuildResult result, SkipReason reason) {
+        result.skipReasons.put(reason, result.skipReasons.get(reason) + 1L);
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal models
+    // -------------------------------------------------------------------------
+
+    private enum SkipReason {
+        MALFORMED_RECORD,
+        CHROMOSOME_NOT_FOUND,
+        SYMBOLIC_OR_INVALID_ALLELE,
+        MULTIALLELIC,
+        NOT_INDEL,
+        COMPLEX_VARIANT,
+        REF_MISMATCH,
+        UNCLASSIFIED
+    }
+
+    private static final class NormalizedIndel {
+        private final String chromosome;
+        private final int start0;
+        private final String deleted;
+        private final String inserted;
+
+        private NormalizedIndel(
+                String chromosome, int start0, String deleted, String inserted) {
+            this.chromosome = chromosome;
+            this.start0 = start0;
+            this.deleted = deleted;
+            this.inserted = inserted;
+        }
+
+        private boolean isDeletion() {
+            return !deleted.isEmpty() && inserted.isEmpty();
+        }
+
+        private boolean isInsertion() {
+            return deleted.isEmpty() && !inserted.isEmpty();
+        }
+    }
+
+    private static final class MatrixBuildResult {
+        private final LinkedHashMap<String, Integer> matrix;
+        private final EnumMap<SkipReason, Long> skipReasons =
+                new EnumMap<>(SkipReason.class);
+        private long totalRecords;
+        private long totalAlleles;
+
+        private MatrixBuildResult(LinkedHashMap<String, Integer> matrix) {
+            this.matrix = matrix;
+
+            for (SkipReason reason : SkipReason.values()) {
+                skipReasons.put(reason, 0L);
+            }
+        }
+    }
+
+    private static final class Genome {
+        private final Map<String, String> sequences;
+
+        private Genome(Map<String, String> sequences) {
+            this.sequences = sequences;
+        }
+
+        private String resolveChromosome(String input) {
+            if (sequences.containsKey(input)) {
+                return input;
+            }
+
+            if (input.startsWith("chr")) {
+                String withoutChr = input.substring(3);
+
+                if (sequences.containsKey(withoutChr)) {
+                    return withoutChr;
+                }
+            } else {
+                String withChr = "chr" + input;
+
+                if (sequences.containsKey(withChr)) {
+                    return withChr;
+                }
+            }
+
+            return null;
+        }
+
+        private String sequence(String chromosome) {
+            return sequences.get(chromosome);
+        }
+    }
+
+    private static final class CosmicData {
+        private final List<String> categories;
+        private final List<String> signatureNames;
+        private final double[][] matrix;
+
+        private CosmicData(
+                List<String> categories,
+                List<String> signatureNames,
+                double[][] matrix) {
+            this.categories = categories;
+            this.signatureNames = signatureNames;
+            this.matrix = matrix;
+        }
+    }
+
+    private static final class ExposureResult {
+        private final String signature;
+        private final double activity;
+        private final double percentage;
+
+        private ExposureResult(
+                String signature, double activity, double percentage) {
+            this.signature = signature;
+            this.activity = activity;
+            this.percentage = percentage;
+        }
+    }
+
+    private static final class SubsetFit {
+        private final double[] exposures;
+        private final double rawDistance;
+
+        private SubsetFit(double[] exposures, double rawDistance) {
+            this.exposures = exposures;
+            this.rawDistance = rawDistance;
+        }
+    }
+
+    private static final class AddResult {
+        private final double[] exposures;
+        private final double distance;
+
+        private AddResult(double[] exposures, double distance) {
+            this.exposures = exposures;
+            this.distance = distance;
+        }
+    }
+
+    private static final class FitResult {
+        private final double[] exposures;
+        private final Set<Integer> activeSignatures;
+
+        private FitResult(double[] exposures, Set<Integer> activeSignatures) {
+            this.exposures = exposures;
+            this.activeSignatures = activeSignatures;
+        }
     }
 }
