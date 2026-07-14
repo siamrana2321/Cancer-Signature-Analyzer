@@ -10,14 +10,20 @@ public class SBS96Response {
     private Map<String, Integer> sbs96Spectrum;
     private Map<String, Map<String, Integer>> sbs96Grouped;
     private Map<String, Map<String, Double>> sbs96Percentage;
-    private List<SignatureResult> cosmicContributions;
-    private List<BiologicalAnnotation> biologicalAnnotations;
+    private List<SignatureContribution> signatureContributions;
     private String clinicalSummary;
+
     private Double reconstructionCosine;
     private Double rmse;
     private Double pearson;
 
-    // Getters and Setters
+    // SigProfilerAssignment reconstruction metrics
+    private Double l1Norm;
+    private Double l1NormPercent;
+    private Double l2Norm;
+    private Double l2NormPercent;
+    private Double klDivergence;
+
     public String getCosmicVersion() { return cosmicVersion; }
     public void setCosmicVersion(String cosmicVersion) { this.cosmicVersion = cosmicVersion; }
 
@@ -33,11 +39,10 @@ public class SBS96Response {
     public Map<String, Map<String, Double>> getSbs96Percentage() { return sbs96Percentage; }
     public void setSbs96Percentage(Map<String, Map<String, Double>> sbs96Percentage) { this.sbs96Percentage = sbs96Percentage; }
 
-    public List<SignatureResult> getCosmicContributions() { return cosmicContributions; }
-    public void setCosmicContributions(List<SignatureResult> cosmicContributions) { this.cosmicContributions = cosmicContributions; }
-
-    public List<BiologicalAnnotation> getBiologicalAnnotations() { return biologicalAnnotations; }
-    public void setBiologicalAnnotations(List<BiologicalAnnotation> biologicalAnnotations) { this.biologicalAnnotations = biologicalAnnotations; }
+    public List<SignatureContribution> getSignatureContributions() { return signatureContributions; }
+    public void setSignatureContributions(List<SignatureContribution> signatureContributions) {
+        this.signatureContributions = signatureContributions;
+    }
 
     public String getClinicalSummary() { return clinicalSummary; }
     public void setClinicalSummary(String clinicalSummary) { this.clinicalSummary = clinicalSummary; }
@@ -51,34 +56,41 @@ public class SBS96Response {
     public Double getPearson() { return pearson; }
     public void setPearson(Double pearson) { this.pearson = pearson; }
 
-    // ---------- Nested DTOs ----------
-    public static class SignatureResult {
+    public Double getL1Norm() { return l1Norm; }
+    public void setL1Norm(Double l1Norm) { this.l1Norm = l1Norm; }
+
+    public Double getL1NormPercent() { return l1NormPercent; }
+    public void setL1NormPercent(Double l1NormPercent) { this.l1NormPercent = l1NormPercent; }
+
+    public Double getL2Norm() { return l2Norm; }
+    public void setL2Norm(Double l2Norm) { this.l2Norm = l2Norm; }
+
+    public Double getL2NormPercent() { return l2NormPercent; }
+    public void setL2NormPercent(Double l2NormPercent) { this.l2NormPercent = l2NormPercent; }
+
+    public Double getKlDivergence() { return klDivergence; }
+    public void setKlDivergence(Double klDivergence) { this.klDivergence = klDivergence; }
+
+    public static class SignatureContribution {
         private String signature;
-        private double similarity;
+        private double contributionPercentage;
         private String etiology;
+        private String contributionLevel;
 
         public String getSignature() { return signature; }
         public void setSignature(String signature) { this.signature = signature; }
 
-        public double getSimilarity() { return similarity; }
-        public void setSimilarity(double similarity) { this.similarity = similarity; }
-
-        public String getEtiology() { return etiology; }
-        public void setEtiology(String etiology) { this.etiology = etiology; }
-    }
-
-    public static class BiologicalAnnotation {
-        private String signature;
-        private String etiology;
-        private String confidence;
-
-        public String getSignature() { return signature; }
-        public void setSignature(String signature) { this.signature = signature; }
+        public double getContributionPercentage() { return contributionPercentage; }
+        public void setContributionPercentage(double contributionPercentage) {
+            this.contributionPercentage = contributionPercentage;
+        }
 
         public String getEtiology() { return etiology; }
         public void setEtiology(String etiology) { this.etiology = etiology; }
 
-        public String getConfidence() { return confidence; }
-        public void setConfidence(String confidence) { this.confidence = confidence; }
+        public String getContributionLevel() { return contributionLevel; }
+        public void setContributionLevel(String contributionLevel) {
+            this.contributionLevel = contributionLevel;
+        }
     }
 }
